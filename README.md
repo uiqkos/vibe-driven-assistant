@@ -24,7 +24,7 @@ sequenceDiagram
 
     User->>GH: Создает Issue
     User->>GH: Ставит лейбл ai-solve
-    GH->>Solve: Триггер (GitHub Actions)
+    GH->>Solve: Webhook → Yandex Cloud
     Solve->>GH: Анализ Issue + код репозитория
     Solve->>GH: Создает PR (ветка issue-N)
     GH->>Review: Триггер (лейбл ai-generated)
@@ -116,25 +116,24 @@ agents:
 
 Допустимые имена агентов: `solve`, `review`, `iterate`, `agentic`, `indexer`.
 
-## GitHub Actions
+## Деплой и инфраструктура
 
-Три workflow автоматизируют полный SDLC-цикл:
+Агент работает на **Yandex Cloud** — Docker-контейнер деплоится на сервер и принимает события от GitHub через webhooks.
 
-| Workflow | Триггер | Действие |
-|---|---|---|
-| `solve-issue.yml` | Issue с лейблом `ai-solve` | Анализ задачи → создание PR |
-| `review-pr.yml` | PR с лейблом `ai-generated` (open/sync) | Code review → комментарий в PR |
-| `iterate-pr.yml` | Комментарий "Changes Requested" в PR | Исправления → push в ту же ветку |
+### Схема работы
 
-### Настройка секретов в репозитории
+1. В целевом репозитории устанавливается **GitHub App**
+2. GitHub App отправляет webhook-события (issues, pull requests, comments) на сервер в Yandex Cloud
+3. Webhook-сервер (`coding-agent serve`) обрабатывает события и запускает соответствующего агента
 
-В Settings → Secrets → Actions добавить:
+### Деплой
 
-- `LLM_API_KEY` — ключ API для LLM-провайдера
-- `LLM_BASE_URL` (опционально) — если не OpenRouter
-- `LLM_MODEL` (опционально) — если не gpt-4o-mini
+```bash
+docker build -t coding-agent .
+docker-compose up -d
+```
 
-`GITHUB_TOKEN` предоставляется автоматически GitHub Actions.
+Контейнер поднимает FastAPI-сервер на порту 8000, который принимает webhooks от GitHub App.
 
 ## Архитектура
 
@@ -219,7 +218,7 @@ mypy src                        # проверка типов
 
 - **Python 3.11+**
 - **LLM**: GPT-4o-mini / GPT-4.1 через OpenRouter (OpenAI-совместимый API)
-- **GitHub**: PyGithub, GitHub Actions
+- **GitHub**: PyGithub, GitHub App (webhooks)
 - **CLI**: Typer + Rich
 - **Webhook-сервер**: FastAPI + Uvicorn
 - **Индексация кода**: tree-sitter (Python, JS/TS, Go, Rust)
