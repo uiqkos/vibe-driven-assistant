@@ -29,7 +29,7 @@ class GitHubService(FileService):
     def __init__(
         self,
         repo_name: str | None = None,
-        branch: str = "main",
+        branch: str | None = None,
         github_client: Github | None = None,
     ) -> None:
         if github_client is not None:
@@ -39,7 +39,9 @@ class GitHubService(FileService):
             self.gh = _make_github_client(settings.github_token)
             self.token = settings.github_token
         self.repo_name = repo_name
-        self.branch = branch
+        if branch is None and repo_name:
+            branch = self.gh.get_repo(repo_name).default_branch
+        self.branch = branch or "main"
         self._pending_changes: dict[str, str] = {}
 
     def _repo(self, repo_full_name: str):
@@ -58,9 +60,9 @@ class GitHubService(FileService):
 
     # ---- Repo files ----
 
-    def get_repo_files(self, repo_name: str, ref: str = "main") -> list[FileInfo]:
+    def get_repo_files(self, repo_name: str, ref: str | None = None) -> list[FileInfo]:
         repo = self._repo(repo_name)
-        tree = repo.get_git_tree(ref, recursive=True)
+        tree = repo.get_git_tree(ref or repo.default_branch, recursive=True)
         files: list[FileInfo] = []
         for item in tree.tree:
             if item.type == "blob" and item.path.endswith(".py"):
@@ -68,9 +70,9 @@ class GitHubService(FileService):
         files.sort(key=lambda f: f.size)
         return files[: settings.max_context_files]
 
-    def get_file_content(self, repo_name: str, path: str, ref: str = "main") -> str:
+    def get_file_content(self, repo_name: str, path: str, ref: str | None = None) -> str:
         repo = self._repo(repo_name)
-        content_file = repo.get_contents(path, ref=ref)
+        content_file = repo.get_contents(path, ref=ref or repo.default_branch)
         if isinstance(content_file, list):
             return ""
         if (content_file.size or 0) > settings.max_file_size_kb * 1024:
@@ -79,9 +81,9 @@ class GitHubService(FileService):
 
     # ---- Branches & commits ----
 
-    def create_branch(self, repo_name: str, branch_name: str, base: str = "main") -> None:
+    def create_branch(self, repo_name: str, branch_name: str, base: str | None = None) -> None:
         repo = self._repo(repo_name)
-        base_sha = repo.get_branch(base).commit.sha
+        base_sha = repo.get_branch(base or repo.default_branch).commit.sha
         repo.create_git_ref(ref=f"refs/heads/{branch_name}", sha=base_sha)
 
     def commit_files(
@@ -100,9 +102,11 @@ class GitHubService(FileService):
     # ---- Pull Requests ----
 
     def create_pr(
-        self, repo_name: str, title: str, body: str, head: str, base: str = "main"
+        self, repo_name: str, title: str, body: str, head: str, base: str | None = None
     ) -> int:
         repo = self._repo(repo_name)
+        if base is None:
+            base = repo.default_branch
         pr = repo.create_pull(title=title, body=body, head=head, base=base)
         return pr.number
 

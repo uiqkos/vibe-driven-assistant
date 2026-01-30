@@ -171,6 +171,13 @@ def explore_structure(
         if needs_module_summaries:
             logger.info("Module nodes missing summaries — summarizing now")
         _ensure_directory_nodes(graph, index_dir)
+        has_dirs = True
+
+    # Patch: ensure root "dir:." node exists even if directory nodes were
+    # previously built without it (pre-fix graphs).
+    if has_dirs and not graph.get_node("dir:."):
+        logger.info("Root directory node missing — patching")
+        _ensure_directory_nodes(graph, index_dir)
 
     q = GraphQuery(graph)
     tree = q.get_directory_tree(path, depth)

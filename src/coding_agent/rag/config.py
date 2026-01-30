@@ -12,4 +12,5 @@ class RAGConfig:
     chunk_size: int = 3000
     chunk_overlap: int = 1000
     top_k: int = 10
-    embedding_batch_size: int = 100
+    embedding_batch_size: int = 50
+    embedding_batch_max_chars: int = 80_000  # stay under provider limits (~100k chars)

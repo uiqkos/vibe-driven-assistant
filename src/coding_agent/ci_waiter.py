@@ -27,13 +27,17 @@ class CIWaiter:
         elapsed = 0
         while elapsed < timeout:
             checks = self.gh.get_check_runs(repo, ref)
-            if checks and all(c.status == "completed" for c in checks):
+            if not checks:
+                logger.info("No CI checks found for %s, skipping wait", ref)
+                return []
+            if all(c.status == "completed" for c in checks):
                 logger.info("CI completed for %s (%d checks)", ref, len(checks))
                 return checks
-            logger.debug(
+            completed = sum(1 for c in checks if c.status == "completed")
+            logger.info(
                 "CI pending for %s (%d/%d completed), waiting %ds...",
                 ref,
-                sum(1 for c in checks if c.status == "completed"),
+                completed,
                 len(checks),
                 poll_interval,
             )

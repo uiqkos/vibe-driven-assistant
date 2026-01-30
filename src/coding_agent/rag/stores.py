@@ -22,7 +22,10 @@ class _OpenRouterEmbeddingFunction(chromadb.EmbeddingFunction):
         self._client = client
 
     def __call__(self, input: list[str]) -> list[list[float]]:
-        return self._client.embed(input)
+        results = self._client.embed(input)
+        # For query-time embedding, replace any failed (None) entries with zero vectors.
+        dim = next((len(e) for e in results if e is not None), 0)
+        return [e if e is not None else [0.0] * dim for e in results]
 
 
 @dataclass
@@ -58,7 +61,7 @@ class CodeStore:
     def __init__(self, persist_dir: Path, config: RAGConfig) -> None:
         self._config = config
         self._client = chromadb.PersistentClient(path=str(persist_dir))
-        self._emb_client = EmbeddingClient(config.code_embedding_model, config.embedding_batch_size)
+        self._emb_client = EmbeddingClient(config.code_embedding_model, config.embedding_batch_size, config.embedding_batch_max_chars)
         self._ef = _OpenRouterEmbeddingFunction(self._emb_client)
         self._collection = self._client.get_or_create_collection(
             name="code_chunks",
@@ -67,19 +70,37 @@ class CodeStore:
         )
 
     def add(self, ids: list[str], documents: list[str], metadatas: list[dict[str, Any]]) -> None:
-        """Add chunks to the store. Handles batching internally."""
+        """Add chunks to the store. Handles batching internally.
+
+        Pre-computes embeddings and skips items whose embeddings failed,
+        so a single bad batch doesn't abort the entire upsert.
+        """
         if not ids:
             return
         ids, documents, metadatas = _dedup(ids, documents, metadatas)
-        logger.info("CodeStore: upserting %d chunks", len(ids))
+        logger.info("CodeStore: embedding %d chunks", len(ids))
+        embeddings = self._emb_client.embed(documents)
+
+        # Filter out items where embedding failed (None)
+        ok = [(i, d, m, e) for i, d, m, e in zip(ids, documents, metadatas, embeddings) if e is not None]
+        skipped = len(ids) - len(ok)
+        if skipped:
+            logger.warning("CodeStore: skipping %d chunks with failed embeddings", skipped)
+        if not ok:
+            logger.error("CodeStore: all embeddings failed, nothing to upsert")
+            return
+        f_ids, f_docs, f_metas, f_embs = zip(*ok)
+
+        logger.info("CodeStore: upserting %d chunks", len(f_ids))
         batch = 500
-        for i in range(0, len(ids), batch):
-            batch_end = min(i + batch, len(ids))
-            logger.debug("CodeStore: upserting batch %d-%d / %d", i, batch_end, len(ids))
+        for i in range(0, len(f_ids), batch):
+            batch_end = min(i + batch, len(f_ids))
+            logger.debug("CodeStore: upserting batch %d-%d / %d", i, batch_end, len(f_ids))
             self._collection.upsert(
-                ids=ids[i : batch_end],
-                documents=documents[i : batch_end],
-                metadatas=metadatas[i : batch_end],
+                ids=list(f_ids[i : batch_end]),
+                documents=list(f_docs[i : batch_end]),
+                metadatas=list(f_metas[i : batch_end]),
+                embeddings=list(f_embs[i : batch_end]),
             )
         logger.info("CodeStore: upsert complete, total count=%d", self._collection.count())
 
@@ -120,6 +141,11 @@ class CodeStore:
     def count(self) -> int:
         return self._collection.count()
 
+    def get_existing_ids(self) -> set[str]:
+        """Return all IDs currently in the collection."""
+        result = self._collection.get()
+        return set(result["ids"]) if result and result.get("ids") else set()
+
     @staticmethod
     def _parse_results(results: dict) -> list[SearchResult]:
         out: list[SearchResult] = []
@@ -145,7 +171,7 @@ class SummaryStore:
     def __init__(self, persist_dir: Path, config: RAGConfig) -> None:
         self._config = config
         self._client = chromadb.PersistentClient(path=str(persist_dir))
-        self._emb_client = EmbeddingClient(config.summary_embedding_model, config.embedding_batch_size)
+        self._emb_client = EmbeddingClient(config.summary_embedding_model, config.embedding_batch_size, config.embedding_batch_max_chars)
         self._ef = _OpenRouterEmbeddingFunction(self._emb_client)
         self._collection = self._client.get_or_create_collection(
             name="summaries",
@@ -157,15 +183,28 @@ class SummaryStore:
         if not ids:
             return
         ids, documents, metadatas = _dedup(ids, documents, metadatas)
-        logger.info("SummaryStore: upserting %d summaries", len(ids))
+        logger.info("SummaryStore: embedding %d summaries", len(ids))
+        embeddings = self._emb_client.embed(documents)
+
+        ok = [(i, d, m, e) for i, d, m, e in zip(ids, documents, metadatas, embeddings) if e is not None]
+        skipped = len(ids) - len(ok)
+        if skipped:
+            logger.warning("SummaryStore: skipping %d summaries with failed embeddings", skipped)
+        if not ok:
+            logger.error("SummaryStore: all embeddings failed, nothing to upsert")
+            return
+        f_ids, f_docs, f_metas, f_embs = zip(*ok)
+
+        logger.info("SummaryStore: upserting %d summaries", len(f_ids))
         batch = 500
-        for i in range(0, len(ids), batch):
-            batch_end = min(i + batch, len(ids))
-            logger.debug("SummaryStore: upserting batch %d-%d / %d", i, batch_end, len(ids))
+        for i in range(0, len(f_ids), batch):
+            batch_end = min(i + batch, len(f_ids))
+            logger.debug("SummaryStore: upserting batch %d-%d / %d", i, batch_end, len(f_ids))
             self._collection.upsert(
-                ids=ids[i : batch_end],
-                documents=documents[i : batch_end],
-                metadatas=metadatas[i : batch_end],
+                ids=list(f_ids[i : batch_end]),
+                documents=list(f_docs[i : batch_end]),
+                metadatas=list(f_metas[i : batch_end]),
+                embeddings=list(f_embs[i : batch_end]),
             )
         logger.info("SummaryStore: upsert complete, total count=%d", self._collection.count())
 
@@ -201,3 +240,8 @@ class SummaryStore:
 
     def count(self) -> int:
         return self._collection.count()
+
+    def get_existing_ids(self) -> set[str]:
+        """Return all IDs currently in the collection."""
+        result = self._collection.get()
+        return set(result["ids"]) if result and result.get("ids") else set()

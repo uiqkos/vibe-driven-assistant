@@ -98,7 +98,7 @@ class GraphQuery:
         Returns:
             ``{name, type, summary, children: [...]}``
         """
-        if path is None:
+        if path is None or path in ("", ".", "/", "./"):
             # Find root directory node (no parent_id or parent is None)
             root = None
             for n in self.graph.nodes:

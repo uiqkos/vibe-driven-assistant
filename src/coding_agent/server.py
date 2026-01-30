@@ -165,18 +165,167 @@ def _ensure_summaries(graph, repo_dir: Path, llm_service, config) -> None:  # no
     summarize_directories(graph.nodes, graph.edges, llm_service)
 
 
-def _sync_rag_index(repo_dir: Path, rag_index_dir: Path) -> None:
-    """Build or incrementally update the RAG vector index."""
-    from coding_agent.rag.indexer import RAGIndexer
+def _sync_rag_index(repo_dir: Path, rag_index_dir: Path, index_dir: Path) -> None:
+    """Sync RAG vector index — only add missing chunks and summaries.
 
-    indexer = RAGIndexer(repo_dir, index_dir=rag_index_dir)
+    1. Compute checksums for all files, compare with stored checksums.
+    2. For new/changed files: chunk and upsert into code store.
+    3. For deleted files: remove stale chunks.
+    4. For summaries: upsert only those missing from summary store.
 
-    if indexer._code_store.count() == 0:
-        logger.info("RAG index empty — full build")
-        indexer.build()
+    Failures are logged but do not interrupt the main pipeline.
+    """
+    try:
+        _do_sync_rag(repo_dir, rag_index_dir, index_dir)
+    except Exception:
+        logger.exception("RAG index sync failed — continuing without RAG")
+
+
+def _do_sync_rag(repo_dir: Path, rag_index_dir: Path, index_dir: Path) -> None:
+    import hashlib
+    import json
+
+    from coding_agent.config import settings
+    from coding_agent.rag.chunker import Chunker
+    from coding_agent.rag.config import RAGConfig
+
+    config = RAGConfig()
+    rag_index_dir.mkdir(parents=True, exist_ok=True)
+
+    from coding_agent.rag.stores import CodeStore, SummaryStore
+
+    code_store = CodeStore(rag_index_dir, config)
+    summary_store = SummaryStore(rag_index_dir, config)
+    chunker = Chunker(config)
+
+    checksums_path = rag_index_dir / "checksums.json"
+    old_checksums: dict[str, str] = {}
+    if checksums_path.exists():
+        old_checksums = json.loads(checksums_path.read_text(encoding="utf-8"))
+
+    # 1. Scan current files and compute checksums
+    files = chunker.collect_files(repo_dir, settings.indexer_exclude_patterns)
+    new_checksums: dict[str, str] = {}
+    for f in files:
+        rel = str(f.relative_to(repo_dir))
+        new_checksums[rel] = hashlib.md5(f.read_bytes()).hexdigest()
+
+    old_files = set(old_checksums.keys())
+    new_files = set(new_checksums.keys())
+    deleted = old_files - new_files
+    added = new_files - old_files
+    changed = {f for f in old_files & new_files if old_checksums[f] != new_checksums[f]}
+
+    logger.info("RAG sync: %d files (+%d added, ~%d changed, -%d deleted)",
+                len(new_files), len(added), len(changed), len(deleted))
+
+    # 2. Remove stale code chunks for deleted/changed files
+    to_remove = deleted | changed
+    if to_remove:
+        code_store.delete_by_file(list(to_remove))
+        summary_store.delete_by_file(list(to_remove))
+
+    # 3. Add code chunks only for new/changed files
+    to_add = added | changed
+    if to_add:
+        all_ids: list[str] = []
+        all_docs: list[str] = []
+        all_metas: list[dict] = []
+        for rel in sorted(to_add):
+            f = repo_dir / rel
+            if not f.exists():
+                continue
+            for chunk in chunker.chunk_file(f, repo_dir):
+                chunk_id = f"{chunk.file_path}::{chunk.chunk_index}"
+                all_ids.append(chunk_id)
+                all_docs.append(chunk.content)
+                all_metas.append({
+                    "file_path": chunk.file_path,
+                    "start_line": chunk.start_line,
+                    "end_line": chunk.end_line,
+                    "language": chunk.language,
+                })
+
+        if all_ids:
+            logger.info("RAG: embedding %d new code chunks...", len(all_ids))
+            code_store.add(all_ids, all_docs, all_metas)
+
+    # 4. Also add any code chunks that are missing (e.g. from a previous partial run)
+    if not to_add and not to_remove:
+        existing_code_ids = code_store.get_existing_ids()
+        expected_code_ids: set[str] = set()
+        for f in files:
+            for chunk in chunker.chunk_file(f, repo_dir):
+                expected_code_ids.add(f"{chunk.file_path}::{chunk.chunk_index}")
+        missing_code = expected_code_ids - existing_code_ids
+        if missing_code:
+            logger.info("RAG: %d code chunks missing from store, backfilling...", len(missing_code))
+            all_ids2: list[str] = []
+            all_docs2: list[str] = []
+            all_metas2: list[dict] = []
+            for f in files:
+                for chunk in chunker.chunk_file(f, repo_dir):
+                    cid = f"{chunk.file_path}::{chunk.chunk_index}"
+                    if cid in missing_code:
+                        all_ids2.append(cid)
+                        all_docs2.append(chunk.content)
+                        all_metas2.append({
+                            "file_path": chunk.file_path,
+                            "start_line": chunk.start_line,
+                            "end_line": chunk.end_line,
+                            "language": chunk.language,
+                        })
+            if all_ids2:
+                code_store.add(all_ids2, all_docs2, all_metas2)
+
+    # 5. Sync summaries — only add missing ones
+    _sync_summaries(index_dir, summary_store)
+
+    # 6. Save checksums
+    checksums_path.write_text(json.dumps(new_checksums, indent=2), encoding="utf-8")
+    logger.info("RAG sync complete: code_chunks=%d, summaries=%d",
+                code_store.count(), summary_store.count())
+
+
+def _sync_summaries(index_dir: Path, summary_store) -> None:  # noqa: ANN001
+    """Add only missing summaries to the summary store."""
+    graph_path = index_dir / "graph.json"
+    if not graph_path.exists():
+        return
+
+    from coding_agent.code_indexer.graph.storage import load_graph
+
+    try:
+        graph = load_graph(index_dir)
+    except Exception:
+        logger.warning("Cannot load graph for summary sync", exc_info=True)
+        return
+
+    existing_ids = summary_store.get_existing_ids()
+
+    ids: list[str] = []
+    docs: list[str] = []
+    metas: list[dict] = []
+
+    for node in graph.nodes:
+        if not node.summary:
+            continue
+        if node.id in existing_ids:
+            continue
+        ids.append(node.id)
+        docs.append(node.summary)
+        metas.append({
+            "node_id": node.id,
+            "file_path": node.file_path,
+            "node_type": node.node_type.value,
+            "name": node.name,
+        })
+
+    if ids:
+        logger.info("RAG: embedding %d missing summaries...", len(ids))
+        summary_store.add(ids, docs, metas)
     else:
-        logger.info("RAG index exists — incremental update")
-        indexer.update()
+        logger.info("RAG: all summaries already in store")
 
 
 # ---------------------------------------------------------------------------
@@ -216,7 +365,7 @@ def _handle_issue_labeled(payload: dict) -> None:
 
     # 4. Build index + RAG
     _build_index_headless(repo_dir, rm.index_dir)
-    _sync_rag_index(repo_dir, rm.rag_index_dir)
+    _sync_rag_index(repo_dir, rm.rag_index_dir, rm.index_dir)
 
     # 5. Run agentic agent
     agent, md_cb = _build_agent_headless(repo_dir, rm.index_dir)
@@ -272,12 +421,15 @@ def _handle_pr_event(payload: dict) -> None:
 
     logger.info("PR #%d: starting review pipeline (sha=%s)", pr_number, head_sha[:8])
 
+    logger.info("PR #%d: obtaining installation token...", pr_number)
     token = _get_installation_token(installation_id)
     gh = _get_gh_service(token, repo_name)
+    logger.info("PR #%d: token obtained, GitHub service ready", pr_number)
 
     # Wait for CI
     from coding_agent.ci_waiter import CIWaiter
 
+    logger.info("PR #%d: waiting for CI checks on sha=%s...", pr_number, head_sha[:8])
     waiter = CIWaiter(gh)
     checks = asyncio.run(waiter.wait_for_ci(repo_name, head_sha))
 
@@ -285,31 +437,48 @@ def _handle_pr_event(payload: dict) -> None:
     if checks:
         ci_lines = [f"- {c.name}: {c.status}/{c.conclusion}" for c in checks]
         ci_text = "\n".join(ci_lines)
+        logger.info("PR #%d: CI complete (%d checks):\n%s", pr_number, len(checks), ci_text)
+    else:
+        logger.info("PR #%d: no CI checks found", pr_number)
 
     # Collect context
+    logger.info("PR #%d: fetching PR diff and metadata...", pr_number)
     diff = gh.get_pr_diff(repo_name, pr_number)
     pr_obj = gh.get_pr(repo_name, pr_number)
+    logger.info("PR #%d: '%s', diff=%d chars", pr_number, pr_obj.title, len(diff))
 
     issue_text = ""
     if pr_obj.body:
         m = re.search(r"#(\d+)", pr_obj.body)
         if m:
+            issue_num = int(m.group(1))
+            logger.info("PR #%d: fetching linked issue #%d...", pr_number, issue_num)
             try:
-                linked = gh.get_issue(repo_name, int(m.group(1)))
+                linked = gh.get_issue(repo_name, issue_num)
                 issue_text = f"Linked issue #{linked.number}: {linked.title}\n{linked.body}"
+                logger.info("PR #%d: linked issue #%d: '%s'", pr_number, linked.number, linked.title)
             except Exception:
-                pass
+                logger.warning("PR #%d: failed to fetch linked issue #%d", pr_number, issue_num, exc_info=True)
 
     # Clone/pull repo + build index for agent
     from coding_agent.services.repo_manager import RepoManager
 
     workdir = Path(settings.workdir).expanduser()
     rm = RepoManager(repo_name, token, workdir=workdir)
+    logger.info("PR #%d: ensuring local repo clone...", pr_number)
     repo_dir = rm.ensure_repo()
+    logger.info("PR #%d: repo ready at %s", pr_number, repo_dir)
+
+    logger.info("PR #%d: building code index...", pr_number)
     _build_index_headless(repo_dir, rm.index_dir)
-    _sync_rag_index(repo_dir, rm.rag_index_dir)
+    logger.info("PR #%d: code index ready", pr_number)
+
+    logger.info("PR #%d: syncing RAG index...", pr_number)
+    _sync_rag_index(repo_dir, rm.rag_index_dir, rm.index_dir)
+    logger.info("PR #%d: RAG index ready", pr_number)
 
     # Run agentic review
+    logger.info("PR #%d: building agent...", pr_number)
     agent, _ = _build_agent_headless(repo_dir, rm.index_dir)
     task = (
         f"Review the following pull request and produce a detailed code review.\n\n"
@@ -330,15 +499,17 @@ def _handle_pr_event(payload: dict) -> None:
         "Start your review with the marker: AI Code Review"
     )
 
-    logger.info("PR #%d: CI done (%s), running agentic review...", pr_number, ci_text or "no checks")
+    logger.info("PR #%d: running agentic review (task=%d chars)...", pr_number, len(task))
 
     try:
         result = agent.run(task)
-        logger.info("PR #%d: review agent finished in %d steps", pr_number, result.steps)
+        logger.info("PR #%d: review agent finished — %d steps, %d tool calls, output=%d chars",
+                     pr_number, result.steps, result.tool_calls_made, len(result.output))
     except Exception:
-        logger.exception("Review agent failed for PR #%d", pr_number)
+        logger.exception("PR #%d: review agent failed", pr_number)
         return
 
+    logger.info("PR #%d: posting review comment...", pr_number)
     gh.add_pr_comment(repo_name, pr_number, result.output)
     logger.info("PR #%d: review posted", pr_number)
 
@@ -364,13 +535,18 @@ def _handle_issue_comment(payload: dict) -> None:
 
     logger.info("Iterating on PR #%d in %s (agentic)", pr_number, repo_name)
 
+    logger.info("PR #%d: obtaining installation token...", pr_number)
     token = _get_installation_token(installation_id)
     gh = _get_gh_service(token, repo_name)
+    logger.info("PR #%d: token obtained, GitHub service ready", pr_number)
 
     # Check iteration count
+    logger.info("PR #%d: fetching PR comments to check iteration count...", pr_number)
     comments = gh.get_pr_comments(repo_name, pr_number)
     iteration_count = sum(1 for c in comments if REVIEW_MARKER in c)
+    logger.info("PR #%d: iteration %d / %d", pr_number, iteration_count, settings.max_iterations)
     if iteration_count > settings.max_iterations:
+        logger.warning("PR #%d: max iterations (%d) reached, stopping", pr_number, settings.max_iterations)
         gh.add_pr_comment(
             repo_name, pr_number,
             f"⛔ Max iterations ({settings.max_iterations}) reached.",
@@ -378,7 +554,9 @@ def _handle_issue_comment(payload: dict) -> None:
         return
 
     # Get PR details
+    logger.info("PR #%d: fetching PR metadata...", pr_number)
     pr_obj = gh.get_pr(repo_name, pr_number)
+    logger.info("PR #%d: '%s', branch=%s", pr_number, pr_obj.title, pr_obj.head_branch)
 
     # Get latest review feedback
     feedback = ""
@@ -390,28 +568,42 @@ def _handle_issue_comment(payload: dict) -> None:
     if not feedback:
         logger.info("PR #%d: no review feedback found, skipping", pr_number)
         return
+    logger.info("PR #%d: review feedback found (%d chars)", pr_number, len(feedback))
 
     # Clone/pull repo + checkout PR branch + build index
     from coding_agent.services.repo_manager import RepoManager
 
     workdir = Path(settings.workdir).expanduser()
     rm = RepoManager(repo_name, token, workdir=workdir)
+    logger.info("PR #%d: ensuring local repo clone (branch=%s)...", pr_number, pr_obj.head_branch)
     repo_dir = rm.ensure_repo(branch=pr_obj.head_branch)
+    logger.info("PR #%d: repo ready at %s", pr_number, repo_dir)
+
+    logger.info("PR #%d: building code index...", pr_number)
     _build_index_headless(repo_dir, rm.index_dir)
-    _sync_rag_index(repo_dir, rm.rag_index_dir)
+    logger.info("PR #%d: code index ready", pr_number)
+
+    logger.info("PR #%d: syncing RAG index...", pr_number)
+    _sync_rag_index(repo_dir, rm.rag_index_dir, rm.index_dir)
+    logger.info("PR #%d: RAG index ready", pr_number)
 
     # Run agentic iterate
+    logger.info("PR #%d: building iterate agent...", pr_number)
     agent, _ = _build_agent_headless(repo_dir, rm.index_dir)
 
     # Get linked issue context
     issue_context = ""
-    m = re.search(r"#(\d+)", pr_obj.body)
-    if m:
-        try:
-            linked = gh.get_issue(repo_name, int(m.group(1)))
-            issue_context = f"\n\nOriginal issue #{linked.number}: {linked.title}\n{linked.body}"
-        except Exception:
-            pass
+    if pr_obj.body:
+        m = re.search(r"#(\d+)", pr_obj.body)
+        if m:
+            issue_num = int(m.group(1))
+            logger.info("PR #%d: fetching linked issue #%d...", pr_number, issue_num)
+            try:
+                linked = gh.get_issue(repo_name, issue_num)
+                issue_context = f"\n\nOriginal issue #{linked.number}: {linked.title}\n{linked.body}"
+                logger.info("PR #%d: linked issue #%d: '%s'", pr_number, linked.number, linked.title)
+            except Exception:
+                logger.warning("PR #%d: failed to fetch linked issue #%d", pr_number, issue_num, exc_info=True)
 
     task = (
         f"You are iterating on PR #{pr_number} based on review feedback.\n\n"
@@ -420,11 +612,14 @@ def _handle_issue_comment(payload: dict) -> None:
         f"{issue_context}"
     )
 
+    logger.info("PR #%d: running iterate agent (task=%d chars)...", pr_number, len(task))
+
     try:
         result = agent.run(task)
-        logger.info("PR #%d: iterate agent finished in %d steps", pr_number, result.steps)
+        logger.info("PR #%d: iterate agent finished — %d steps, %d tool calls, output=%d chars",
+                     pr_number, result.steps, result.tool_calls_made, len(result.output))
     except Exception:
-        logger.exception("Iterate agent failed for PR #%d", pr_number)
+        logger.exception("PR #%d: iterate agent failed", pr_number)
         return
 
     if not rm.has_changes():
@@ -434,7 +629,7 @@ def _handle_issue_comment(payload: dict) -> None:
 
     rm.commit(f"Iterate on review feedback (#{pr_number})")
     rm.push(pr_obj.head_branch)
-    logger.info("PR #%d: iteration pushed", pr_number)
+    logger.info("PR #%d: iteration pushed to %s", pr_number, pr_obj.head_branch)
 
 
 # ---------------------------------------------------------------------------

@@ -224,6 +224,8 @@ def _resolve_path(service: FileService, path: str) -> Path:
 
 def _walk_files(root: Path, include: str | None = None) -> list[Path]:
     """Recursively collect files, optionally filtered by glob."""
+    if root.is_file():
+        return [root]
     files: list[Path] = []
     for fpath in sorted(root.rglob("*")):
         if not fpath.is_file():

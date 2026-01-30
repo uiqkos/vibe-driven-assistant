@@ -15,23 +15,21 @@ def _format_code_result(r: SearchResult) -> str:
     start = r.metadata.get("start_line", "?")
     end = r.metadata.get("end_line", "?")
     lang = r.metadata.get("language", "")
-    header = f"[Score: {r.score:.2f}] {fp}:{start}-{end} ({lang})"
+    node_id = r.metadata.get("node_id", r.id)
+    header = f"[Score: {r.score:.2f}] [ID: {r.id}] [Node: {node_id}] {fp}:{start}-{end} ({lang})"
     separator = "\u2500" * min(len(header), 50)
-    content = r.content
-    if len(content) > 2000:
-        content = content[:2000] + "\n... (truncated)"
-    return f"{header}\n{separator}\n{content}"
+    return f"{header}\n{separator}\n{r.content}"
 
 
 def _format_summary_result(r: SearchResult) -> str:
     node_id = r.metadata.get("node_id", r.id)
     fp = r.metadata.get("file_path", "?")
     nt = r.metadata.get("node_type", "?")
-    header = f"[Score: {r.score:.2f}] {node_id} ({nt}) in {fp}"
+    header = f"[Score: {r.score:.2f}] [ID: {r.id}] [Node: {node_id}] ({nt}) in {fp}"
     return f"{header}\n  {r.content}"
 
 
-def _search_code(index_dir: str, query: str, top_k: int = 10, file_filter: str = "") -> str:
+def _search_code(index_dir: str, query: str, top_k: int = 3, file_filter: str = "") -> str:
     config = RAGConfig()
     store = CodeStore(Path(index_dir), config)
     where = None
@@ -44,7 +42,7 @@ def _search_code(index_dir: str, query: str, top_k: int = 10, file_filter: str =
     return f"Found {len(results)} code chunks:\n\n" + "\n\n".join(parts)
 
 
-def _search_semantic(index_dir: str, query: str, top_k: int = 10) -> str:
+def _search_semantic(index_dir: str, query: str, top_k: int = 3) -> str:
     config = RAGConfig()
     store = SummaryStore(Path(index_dir), config)
     results = store.query(query, top_k=top_k)
@@ -54,7 +52,7 @@ def _search_semantic(index_dir: str, query: str, top_k: int = 10) -> str:
     return f"Found {len(results)} summaries:\n\n" + "\n".join(parts)
 
 
-def _search_hybrid(index_dir: str, query: str, top_k: int = 10) -> str:
+def _search_hybrid(index_dir: str, query: str, top_k: int = 3) -> str:
     config = RAGConfig()
     code_store = CodeStore(Path(index_dir), config)
     summary_store = SummaryStore(Path(index_dir), config)
@@ -95,10 +93,12 @@ def create_rag_tools(index_dir: str) -> list[Tool]:
         Tool(
             name="rag_search_code",
             description=(
-                "Semantic code search via vector embeddings. "
-                "Finds code by MEANING, not just name — understands natural language. "
-                "Returns code snippets with exact file paths and line numbers. "
-                "Works for all file types: Python, JS/TS, Go, Rust, config files, docs."
+                "RECOMMENDED starting point for any code search. "
+                "Universal semantic code search via vector embeddings — finds code by MEANING, not just name. "
+                "Returns code snippets with exact file paths, line numbers, and node IDs "
+                "(usable with other indexer tools like get_node_info/get_source_code). "
+                "Works for all file types: Python, JS/TS, Go, Rust, config files, docs. "
+                "Always try this tool first before resorting to grep or manual file browsing."
             ),
             parameters={
                 "type": "object",
@@ -114,8 +114,8 @@ def create_rag_tools(index_dir: str) -> list[Tool]:
                     },
                     "top_k": {
                         "type": "integer",
-                        "description": "Number of results to return (default 10). Use 20+ for broad searches.",
-                        "default": 10,
+                        "description": "Number of results to return (default 3). Do NOT set higher than 3 to avoid filling up the context window.",
+                        "default": 3,
                     },
                     "file_filter": {
                         "type": "string",
@@ -128,17 +128,19 @@ def create_rag_tools(index_dir: str) -> list[Tool]:
             execute=lambda args: _search_code(
                 index_dir,
                 args["query"],
-                args.get("top_k", 10),
+                args.get("top_k", 3),
                 args.get("file_filter", ""),
             ),
         ),
         Tool(
             name="rag_search_semantic",
             description=(
-                "Search AI-generated summaries of modules, classes, and functions by meaning. "
+                "RECOMMENDED for understanding architecture and component responsibilities. "
+                "Universal semantic search over AI-generated summaries of modules, classes, and functions. "
                 "Finds components by PURPOSE and BEHAVIOR without reading source code. "
                 "Returns node IDs (usable with get_node_info/get_source_code), file paths, and types. "
-                "Use over rag_search_code when you need to understand WHAT code does, not HOW."
+                "Use over rag_search_code when you need to understand WHAT code does, not HOW. "
+                "Start here when exploring unfamiliar parts of the codebase."
             ),
             parameters={
                 "type": "object",
@@ -153,8 +155,8 @@ def create_rag_tools(index_dir: str) -> list[Tool]:
                     },
                     "top_k": {
                         "type": "integer",
-                        "description": "Number of results to return (default 10).",
-                        "default": 10,
+                        "description": "Number of results to return (default 3). Do NOT set higher than 3 to avoid filling up the context window.",
+                        "default": 3,
                     },
                 },
                 "required": ["query"],
@@ -162,15 +164,17 @@ def create_rag_tools(index_dir: str) -> list[Tool]:
             execute=lambda args: _search_semantic(
                 index_dir,
                 args["query"],
-                args.get("top_k", 10),
+                args.get("top_k", 3),
             ),
         ),
         Tool(
             name="rag_search_hybrid",
             description=(
-                "Combined search across BOTH code snippets AND summaries in one call. "
-                "Returns a ranked mix of code chunks (with line numbers) and component descriptions. "
-                "Best first tool when investigating a bug or feature — gives both code and context."
+                "RECOMMENDED first tool for any investigation — combines code search and summary search in one call. "
+                "Universal hybrid search across BOTH code snippets AND AI-generated summaries. "
+                "Returns a ranked mix of code chunks (with file paths, line numbers, and node IDs) "
+                "and component descriptions. Best starting point when investigating a bug, feature, or concept. "
+                "Always start your search here before using more targeted tools."
             ),
             parameters={
                 "type": "object",
@@ -185,8 +189,8 @@ def create_rag_tools(index_dir: str) -> list[Tool]:
                     },
                     "top_k": {
                         "type": "integer",
-                        "description": "Number of results to return (default 10). Use 15-20 for complex investigations.",
-                        "default": 10,
+                        "description": "Number of results to return (default 3). Do NOT set higher than 3 to avoid filling up the context window.",
+                        "default": 3,
                     },
                 },
                 "required": ["query"],
@@ -194,7 +198,7 @@ def create_rag_tools(index_dir: str) -> list[Tool]:
             execute=lambda args: _search_hybrid(
                 index_dir,
                 args["query"],
-                args.get("top_k", 10),
+                args.get("top_k", 3),
             ),
         ),
     ]

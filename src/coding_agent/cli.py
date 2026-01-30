@@ -328,14 +328,22 @@ def review(
 
     level = logging.DEBUG if verbose else logging.WARNING
     logging.basicConfig(level=level, format="%(name)s | %(levelname)s | %(message)s")
+    log = logging.getLogger("coding_agent.review")
+    log.setLevel(logging.DEBUG if verbose else logging.INFO)
+
+    log.info("Starting review for %s PR #%d", repo, pr)
 
     token = settings.github_token
     workdir = Path(settings.workdir).expanduser()
 
     # 1. Collect context
+    log.info("Fetching PR metadata and diff...")
     gh = GitHubService(repo_name=repo)
     pr_obj = gh.get_pr(repo, pr)
+    log.info("PR #%d: '%s' by %s (%s -> %s)",
+             pr, pr_obj.title, pr_obj.user, pr_obj.head_branch, pr_obj.base_branch)
     diff = gh.get_pr_diff(repo, pr)
+    log.info("Diff fetched: %d chars", len(diff))
 
     # Try to get linked issue
     issue_text = ""
@@ -343,29 +351,47 @@ def review(
         import re
         match = re.search(r"#(\d+)", pr_obj.body)
         if match:
+            issue_num = int(match.group(1))
+            log.info("Found linked issue #%d in PR body, fetching...", issue_num)
             try:
-                linked = gh.get_issue(repo, int(match.group(1)))
+                linked = gh.get_issue(repo, issue_num)
                 issue_text = f"Linked issue #{linked.number}: {linked.title}\n{linked.body}"
+                log.info("Linked issue #%d: '%s'", linked.number, linked.title)
             except Exception:
-                pass
+                log.warning("Failed to fetch linked issue #%d", issue_num, exc_info=True)
+    else:
+        log.info("No PR body — skipping linked issue lookup")
 
     # CI status
     ci_text = ""
+    log.info("Fetching CI status for branch '%s'...", pr_obj.head_branch)
     try:
         checks = gh.get_check_runs(repo, pr_obj.head_branch)
         if checks:
             ci_lines = [f"- {c.name}: {c.status}/{c.conclusion}" for c in checks]
             ci_text = "\n".join(ci_lines)
+            log.info("CI checks (%d):\n%s", len(checks), ci_text)
+        else:
+            log.info("No CI checks found")
     except Exception:
-        pass
+        log.warning("Failed to fetch CI status", exc_info=True)
 
     # 2. Ensure repo + index for agent exploration
+    log.info("Ensuring local repo clone...")
     rm = RepoManager(repo, token, workdir=workdir)
     repo_dir = rm.ensure_repo()
+    log.info("Repo dir: %s", repo_dir)
+
+    log.info("Building code index...")
     _build_index(repo_dir, rm.index_dir, use_llm=llm_index)
+    log.info("Code index ready at %s", rm.index_dir)
+
+    log.info("Building RAG index...")
     _build_rag_index(repo_dir, rm.rag_index_dir)
+    log.info("RAG index ready at %s", rm.rag_index_dir)
 
     # 3. Run agent
+    log.info("Building agent (max_steps=%d)...", max_steps)
     agent, _ = _build_agent(repo_dir, rm.index_dir, max_steps=max_steps)
     task = (
         f"Review the following pull request and produce a detailed code review.\n\n"
@@ -385,14 +411,21 @@ def review(
         "- CI analysis if applicable"
     )
 
+    log.info("Running agent with task (%d chars)...", len(task))
     try:
         result = agent.run(task)
     except MaxStepsError:
+        log.error("Agent exceeded max steps")
         console.print("[red]Agent exceeded max steps.[/red]")
         raise typer.Exit(1)
 
+    log.info("Agent finished: %d steps, %d tool calls, output %d chars",
+             result.steps, result.tool_calls_made, len(result.output))
+
     # 4. Post review comment
+    log.info("Posting review comment to PR #%d...", pr)
     gh.add_pr_comment(repo, pr, result.output)
+    log.info("Review posted successfully")
     console.print(f"[green]Review posted to PR #{pr}[/green]")
 
 

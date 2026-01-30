@@ -36,14 +36,20 @@ class RepoManager:
         for attempt in range(retries + 1):
             try:
                 return subprocess.run(cmd, check=True, capture_output=True, text=True, **kwargs)
-            except subprocess.CalledProcessError:
+            except subprocess.CalledProcessError as exc:
+                # Sanitize token from logged output
+                safe_cmd = " ".join(cmd).replace(self._token, "***") if self._token else " ".join(cmd)
+                stderr = (exc.stderr or "").replace(self._token, "***") if self._token else (exc.stderr or "")
                 if attempt < retries:
                     delay = 2 ** attempt
-                    logger.warning("Command failed (attempt %d/%d), retrying in %ds: %s",
-                                   attempt + 1, retries + 1, delay, " ".join(cmd))
+                    logger.warning("Command failed (attempt %d/%d), retrying in %ds: %s\nstderr: %s",
+                                   attempt + 1, retries + 1, delay, safe_cmd, stderr)
                     time.sleep(delay)
                 else:
+                    logger.error("Command failed after %d attempts: %s\nstderr: %s",
+                                 retries + 1, safe_cmd, stderr)
                     raise
+        raise AssertionError("unreachable")  # retries loop always returns or raises
 
     def _configure_git(self) -> None:
         """Set git user identity if not already configured."""
@@ -53,17 +59,73 @@ class RepoManager:
             self._run(["git", "config", "user.name", "coding-agent"], cwd=self.repo_dir)
             self._run(["git", "config", "user.email", "coding-agent@noreply"], cwd=self.repo_dir)
 
-    def ensure_repo(self, branch: str = "main") -> Path:
-        """Clone if not exists, else fetch + reset. Returns repo_dir."""
+    def _cleanup_lock_files(self) -> None:
+        """Remove stale git lock files that block operations."""
+        for lock in self.repo_dir.rglob(".git/*.lock"):
+            logger.warning("Removing stale lock file: %s", lock)
+            lock.unlink(missing_ok=True)
+        # Also check nested lock files (e.g. .git/refs/heads/*.lock)
+        for lock in self.repo_dir.rglob(".git/**/*.lock"):
+            logger.warning("Removing stale lock file: %s", lock)
+            lock.unlink(missing_ok=True)
+
+    def _reclone(self) -> None:
+        """Delete the repo directory and clone from scratch."""
+        import shutil
+
+        logger.warning("Re-cloning %s (deleting %s)", self.repo_name, self.repo_dir)
+        shutil.rmtree(self.repo_dir, ignore_errors=True)
+        self.repo_dir.parent.mkdir(parents=True, exist_ok=True)
+        self._run(["git", "clone", self._clone_url, str(self.repo_dir)], retries=5)
+
+    def _detect_default_branch(self) -> str:
+        """Detect the default branch name from the remote."""
+        try:
+            result = self._run(
+                ["git", "symbolic-ref", "refs/remotes/origin/HEAD"],
+                cwd=self.repo_dir,
+            )
+            # Output: "refs/remotes/origin/main" or "refs/remotes/origin/master"
+            return result.stdout.strip().split("/")[-1]
+        except subprocess.CalledProcessError:
+            pass
+
+        # Fallback: query remote directly
+        try:
+            result = self._run(
+                ["git", "remote", "show", "origin"],
+                cwd=self.repo_dir,
+            )
+            for line in result.stdout.splitlines():
+                if "HEAD branch:" in line:
+                    return line.split(":")[-1].strip()
+        except subprocess.CalledProcessError:
+            pass
+
+        logger.warning("Could not detect default branch, falling back to 'main'")
+        return "main"
+
+    def ensure_repo(self, branch: str | None = None) -> Path:
+        """Clone if not exists, else fetch + reset. Returns repo_dir.
+
+        If *branch* is not specified, the remote's default branch is used.
+        """
         if not (self.repo_dir / ".git").exists():
             logger.info("Cloning %s into %s", self.repo_name, self.repo_dir)
             self.repo_dir.parent.mkdir(parents=True, exist_ok=True)
-            self._run(["git", "clone", self._clone_url, str(self.repo_dir)], retries=2)
+            self._run(["git", "clone", self._clone_url, str(self.repo_dir)], retries=5)
         else:
-            logger.info("Fetching updates for %s", self.repo_name)
-            self._run(["git", "fetch", "origin"], cwd=self.repo_dir, retries=2)
-            self._run(["git", "checkout", "--force", branch], cwd=self.repo_dir)
-            self._run(["git", "reset", "--hard", f"origin/{branch}"], cwd=self.repo_dir)
+            if branch is None:
+                branch = self._detect_default_branch()
+            logger.info("Fetching updates for %s (branch=%s)", self.repo_name, branch)
+            self._cleanup_lock_files()
+            try:
+                self._run(["git", "fetch", "origin"], cwd=self.repo_dir, retries=5)
+                self._run(["git", "checkout", "--force", branch], cwd=self.repo_dir, retries=5)
+                self._run(["git", "reset", "--hard", f"origin/{branch}"], cwd=self.repo_dir, retries=5)
+            except subprocess.CalledProcessError:
+                logger.warning("Fetch/checkout failed after retries — re-cloning repo")
+                self._reclone()
         self._configure_git()
         # Ensure remote URL has the current token
         self._run(["git", "remote", "set-url", "origin", self._clone_url], cwd=self.repo_dir)

@@ -53,10 +53,6 @@ class RAGIndexer:
                      self.config.chunk_size, self.config.chunk_overlap,
                      self.config.code_embedding_model, self.config.summary_embedding_model)
 
-        logger.info("Clearing existing stores...")
-        self._code_store.clear()
-        self._summary_store.clear()
-
         logger.info("Collecting files (exclude: %s)...", settings.indexer_exclude_patterns)
         files = self._chunker.collect_files(self.project_dir, settings.indexer_exclude_patterns)
         logger.info("Found %d files to index", len(files))

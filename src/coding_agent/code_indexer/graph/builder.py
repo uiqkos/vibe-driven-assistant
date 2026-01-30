@@ -214,8 +214,8 @@ class GraphBuilder:
                 for i in range(1, len(parts)):
                     dir_paths.add("/".join(parts[:i]))
 
-        # Also add root "" if there are any top-level modules
-        if any(v == "" for v in module_dir.values()):
+        # Always add root "" so subdirectories have a valid parent
+        if dir_paths or any(v == "" for v in module_dir.values()):
             dir_paths.add("")
 
         # Create DIRECTORY nodes
@@ -253,7 +253,7 @@ class GraphBuilder:
                     ))
 
         # Add CONTAINS edges for directory→subdirectory
-        for _dp, dn in dir_nodes.items():
+        for dn in dir_nodes.values():
             if dn.parent_id and dn.parent_id.startswith("dir:"):
                 edges.append(Edge(
                     source=dn.parent_id,
