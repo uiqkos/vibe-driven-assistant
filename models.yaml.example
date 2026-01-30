@@ -1,0 +1,19 @@
+# Model configuration for coding-agent.
+# Copy to models.yaml and adjust as needed.
+# If models.yaml is absent, env variables LLM_MODEL / LLM_BASE_URL are used.
+
+default:
+  model: openai/gpt-4.1-mini
+  temperature: 0.2
+  max_tokens: null        # null = provider default (no limit)
+  base_url: https://openrouter.ai/api/v1
+
+# Per-agent overrides (optional). Only specified fields are overridden.
+# Valid agent names: solve, review, iterate, agentic, indexer
+agents:
+  review:
+    model: openai/gpt-4.1
+    temperature: 0.1
+  agentic:
+    model: openai/gpt-4.1
+    max_tokens: 16000

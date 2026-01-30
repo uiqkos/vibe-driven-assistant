@@ -1,0 +1,29 @@
+name: Iterate PR
+
+on:
+  issue_comment:
+    types: [created]
+
+jobs:
+  iterate:
+    if: >
+      github.event.issue.pull_request &&
+      contains(github.event.comment.body, 'Changes Requested')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install coding-agent
+        run: pip install -e .
+
+      - name: Iterate on PR
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
+          LLM_BASE_URL: ${{ secrets.LLM_BASE_URL }}
+          LLM_MODEL: ${{ secrets.LLM_MODEL }}
+        run: coding-agent iterate --repo ${{ github.repository }} --pr ${{ github.event.issue.number }}

@@ -1,0 +1,27 @@
+name: Solve Issue
+
+on:
+  issues:
+    types: [opened, labeled]
+
+jobs:
+  solve:
+    if: contains(github.event.issue.labels.*.name, 'ai-solve')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install coding-agent
+        run: pip install -e .
+
+      - name: Solve issue
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
+          LLM_BASE_URL: ${{ secrets.LLM_BASE_URL }}
+          LLM_MODEL: ${{ secrets.LLM_MODEL }}
+        run: coding-agent solve --repo ${{ github.repository }} --issue ${{ github.event.issue.number }}

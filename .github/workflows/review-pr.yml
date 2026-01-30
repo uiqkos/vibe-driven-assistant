@@ -1,0 +1,30 @@
+name: Review PR
+
+on:
+  pull_request:
+    types: [opened, synchronize]
+
+jobs:
+  review:
+    if: contains(github.event.pull_request.labels.*.name, 'ai-generated')
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install coding-agent
+        run: pip install -e .
+
+      - name: Wait for CI
+        run: sleep 30
+
+      - name: Review PR
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          LLM_API_KEY: ${{ secrets.LLM_API_KEY }}
+          LLM_BASE_URL: ${{ secrets.LLM_BASE_URL }}
+          LLM_MODEL: ${{ secrets.LLM_MODEL }}
+        run: coding-agent review --repo ${{ github.repository }} --pr ${{ github.event.pull_request.number }}

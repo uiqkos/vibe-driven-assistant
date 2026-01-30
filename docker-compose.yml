@@ -1,0 +1,19 @@
+services:
+  coding-agent:
+    build: .
+    env_file: .env
+    ports:
+      - "8000:8000"
+    volumes:
+      - ~/.coding-agent:/root/.coding-agent
+      - ./private-key.pem:/app/private-key.pem:ro
+
+  ngrok:
+    image: ngrok/ngrok:latest
+    command: http coding-agent:8000
+    environment:
+      - NGROK_AUTHTOKEN=${NGROK_AUTHTOKEN:-}
+    ports:
+      - "4040:4040"
+    profiles:
+      - dev
